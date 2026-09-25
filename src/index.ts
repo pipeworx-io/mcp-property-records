@@ -1,11 +1,19 @@
 interface McpToolDefinition {
   name: string;
   description: string;
+  /** Human-facing one-liner (fleet #1967). Optional; consumers fall back to
+   *  description. Kept in step with shared/src/types.ts — scripts/lib/
+   *  check-inlined-types.mjs reports drift at publish time. */
+  summary?: string;
   inputSchema: {
     type: 'object';
     properties: Record<string, unknown>;
     required?: string[];
+    anyOf?: Array<{ required: string[] }>;
+    oneOf?: Array<{ required: string[] }>;
+    allOf?: Array<{ required: string[] }>;
   };
+  outputSchema?: Record<string, unknown>;
 }
 
 interface McpToolExport {
@@ -16,6 +24,91 @@ interface McpToolExport {
   provider?: string;
 }
 
+/**
+ * The class routing tokens, and the two safe ways to wrap a message carrying one.
+ *
+ * A pack signals an error's class with a leading token — `user_error:`,
+ * `upstream_down:`, `upstream_throttled:`, `not_found:`, `blocked_host:`. The
+ * gateway's classifier anchors on `^`, and `stripClassPrefix` (which hides the
+ * token from the caller) anchors on `^` too. So the convention has one failure
+ * mode, and it is silent: a catch block that wraps the message —
+ * `` `${slug}/${tool}: ${message}` `` — pushes the token off position 0. The
+ * error then books as `error` ("Pipeworx has a defect") instead of as the
+ * caller mistake it is, AND the raw token leaks into what the caller reads.
+ *
+ * Nothing about that fails loudly. The call still returns, the message still
+ * reads plausibly, and the misclassification only shows up as a pack sitting on
+ * the Problem Tools list for a bug it does not have. Found live in
+ * `medicaid-intelligence` on 2026-08-21; the same wrapper template is copied
+ * across 18 DMV packs, none of which emit a token *yet*.
+ *
+ * `scripts/check-error-class-prefix.mjs` is the gate that keeps this honest —
+ * it fails any pack that both emits a token and wraps a caught message without
+ * using one of the helpers below.
+ */
+
+/**
+ * The canonical token set. `workers/gateway/src/error-class.ts` carries its own
+ * copy on the read side (it is deliberately importable without pulling a pack
+ * in); the gate asserts the two agree, because this list has already drifted
+ * twice — `not_found:` and `blocked_host:` were honoured by the classifier and
+ * not stripped, so both went out to callers verbatim for months.
+ */
+const CLASS_TOKENS = [
+  'upstream_down',
+  'upstream_throttled',
+  'user_error',
+  'not_found',
+  'blocked_host',
+  // `blocked_url:` is emitted at position 0 from five sites in ssrf.ts
+  // (`assertPublicHttpUrl`, and every redirect hop in `safeFetch`) and was in
+  // NEITHER reader — so it went to callers verbatim for its whole life. Caught
+  // 2026-08-21 by a live n8n call, which answered a private instance_url with
+  // "…host). blocked_url: refusing to fetch non-public or non-https URL".
+  // Exactly the drift the gate now blocks.
+  'blocked_url',
+  // `auth_required:` joins the list 2026-08-29 (fleet #638). It exists for the
+  // same reason `user_error:` does: a bare 401/403 in an upstream body matches
+  // the `upstream_throttled` heuristic below before anything auth-specific, so
+  // a pack that needs to say "this is a credential problem, not a rate limit"
+  // has no wording-based route — only the explicit-prefix escape hatch works.
+  // tiingo and open-sanctions both reached for it on their own, on the
+  // (reasonable, but wrong at the time) assumption that any snake_case class
+  // already meant something to the gateway. Neither shipped a leak from
+  // MIS-CLASSIFICATION — the `error` field was already correct — the leak was
+  // the literal token riding along in `message`, unstripped, because this list
+  // didn't know the token either reader was seeing.
+  'auth_required',
+] as const;
+
+const CLASS_PREFIX_RE =
+  /^(?:upstream_down|upstream_throttled|user_error|not_found|blocked_host|blocked_url|auth_required)\s*:\s*/;
+
+/**
+ * Split a caught message into its leading routing token (possibly empty) and
+ * the human-readable body, so a wrapper can put the token back on the front.
+ *
+ *   const { token, body } = splitClassPrefix(message);
+ *   return { error: `${token}my-pack/${name}: ${body}` };
+ *
+ * The `${token}` must be the FIRST thing in the template — that is the whole
+ * point, and it is what the gate checks.
+ */
+function splitClassPrefix(message: string): { token: string; body: string } {
+  const token = message.match(CLASS_PREFIX_RE)?.[0] ?? '';
+  return { token, body: message.slice(token.length) };
+}
+
+/**
+ * Drop a leading routing token from a message that is about to become a
+ * FRAGMENT of a larger one — a per-mirror failure joined into "all providers
+ * failed (...)", say. Hoisting is wrong there: the fragment never reaches
+ * position 0, so the token cannot route anything and would only leak. The outer
+ * message declares its own class.
+ */
+function dropClassPrefix(message: string): string {
+  return message.replace(CLASS_PREFIX_RE, '');
+}
 /**
  * Property Records MCP — address-level US property records (sales history,
  * assessed value, owner, physical characteristics) straight from county / city
@@ -216,7 +309,10 @@ async function getJson<T>(url: string, label: string): Promise<T> {
   } catch (err) {
     const e = err as Error;
     if (e.name === 'AbortError') throw new Error(`${label}: timed out after ${TIMEOUT_MS}ms`);
-    throw new Error(`${label}: ${e.message}`);
+    // `label` in front of a class token would push it off position 0, which
+    // silently reclassifies the error and leaks the token. Hoist it.
+    const { token, body } = splitClassPrefix(e.message);
+    throw new Error(`${token}${label}: ${body}`);
   } finally {
     clearTimeout(timer);
   }
@@ -388,7 +484,45 @@ function streetTypeIndex(tokens: string[]): number {
   return -1;
 }
 
+/**
+ * Spelled-out ordinals for numbered streets. Callers write "Fifth Avenue" and
+ * "Third St"; every portal we hit stores the digit form ("5 AVENUE" in NYC's
+ * roll, "5TH ST NW" in DC). Measured 2026-07-27: "350 Fifth Avenue, Manhattan"
+ * found nothing while "350 5th Ave" matched — same street, and nothing in the
+ * response told the caller the spelling was the problem.
+ */
+const ORDINAL_WORDS: Record<string, string> = {
+  FIRST: '1', SECOND: '2', THIRD: '3', FOURTH: '4', FIFTH: '5', SIXTH: '6',
+  SEVENTH: '7', EIGHTH: '8', NINTH: '9', TENTH: '10', ELEVENTH: '11',
+  TWELFTH: '12', THIRTEENTH: '13', FOURTEENTH: '14', FIFTEENTH: '15',
+  SIXTEENTH: '16', SEVENTEENTH: '17', EIGHTEENTH: '18', NINETEENTH: '19',
+  TWENTIETH: '20', THIRTIETH: '30', FORTIETH: '40', FIFTIETH: '50',
+  SIXTIETH: '60', SEVENTIETH: '70', EIGHTIETH: '80', NINETIETH: '90',
+};
+
+/** ["FIFTH","AVENUE"] → ["5TH","AVENUE"]; null when nothing was spelled out. */
+function digitizeOrdinals(tokens: string[]): string[] | null {
+  const typeIdx = streetTypeIndex(tokens);
+  let hit = false;
+  const out = tokens.map((tok, i) => {
+    const n = i === typeIdx ? undefined : ORDINAL_WORDS[tok];
+    if (!n) return tok;
+    hit = true;
+    return `${n}${ordinalSuffix(n)}`;
+  });
+  return hit ? out : null;
+}
+
 function streetVariants(tokens: string[]): string[] {
+  const out = baseVariants(tokens);
+  // Token count is preserved, so streetTypeIndex still points at the same slot
+  // and looseVariants can keep indexing these by position.
+  const digits = digitizeOrdinals(tokens);
+  if (digits) for (const v of baseVariants(digits)) if (!out.includes(v)) out.push(v);
+  return out;
+}
+
+function baseVariants(tokens: string[]): string[] {
   if (!tokens.length) return [];
   const typeIdx = streetTypeIndex(tokens);
   const out: string[] = [];
@@ -424,6 +558,15 @@ function streetVariants(tokens: string[]): string[] {
 function looseVariants(tokens: string[]): string[] {
   const typeIdx = streetTypeIndex(tokens);
   if (typeIdx < 0) return [];
+  // On a NUMBERED street the type token is the only thing distinguishing one
+  // street from another — "5 AVENUE" and "5 STREET" are different streets in
+  // the same borough — and wildcarding it also lets the number itself bleed
+  // ("350 5%" matches "350 57 STREET"). Measured 2026-07-27: "350 5th Ave,
+  // New York, NY" answered with 350 57th Street in BROOKLYN, carrying that
+  // property's real sale history. A confident wrong answer is worse than a
+  // miss here, so numbered streets get no second chance.
+  const stem = tokens[typeIdx - 1] ?? '';
+  if (/^\d+(?:ST|ND|RD|TH)?$/.test(stem) || ORDINAL_WORDS[stem]) return [];
   const out: string[] = [];
   for (const v of streetVariants(tokens)) {
     const parts = v.split(' ');
@@ -769,6 +912,8 @@ const NYC_ROLL = 'https://data.cityofnewyork.us/resource/8y4t-faws.json';
 const NYC_BOROUGH: Record<string, string> = {
   MANHATTAN: '1', BRONX: '2', 'THE BRONX': '2', BROOKLYN: '3', QUEENS: '4', 'STATEN ISLAND': '5',
 };
+/** How far below the requested house number a parcel's range may start. */
+const ROLL_HOUSENUM_WINDOW = 40;
 const NYC_BOROUGH_NAME: Record<string, string> = {
   '1': 'Manhattan', '2': 'Bronx', '3': 'Brooklyn', '4': 'Queens', '5': 'Staten Island',
 };
@@ -859,18 +1004,50 @@ async function lookupNyc(p: ParsedAddress, maxSales: number): Promise<PropertyRe
       .map((v) => `upper(street_name) like '${q(v)}%'`)
       .join(' OR ');
     const boro = p.city && NYC_BOROUGH[p.city] ? ` AND boro='${NYC_BOROUGH[p.city]}'` : '';
+    // The roll indexes parcels by house-number RANGE, not by street address:
+    // the Empire State Building is housenum_lo 338 / housenum_hi 350, so an
+    // equality test on "350" misses it — and it misses most large buildings the
+    // same way (measured 2026-07-27, the whole reason "350 5th Ave" came back
+    // empty). Socrata can't do the comparison for us: a `::number` cast on this
+    // column 400s on the "1443A" style values that live elsewhere in it. So
+    // pull a window of plausible range starts and contain-test here.
+    const target = num(p.house_number.replace(/\D/g, ''));
+    const los: string[] = [];
+    if (target !== null) {
+      for (let n = target; n >= Math.max(0, target - ROLL_HOUSENUM_WINDOW); n--) los.push(String(n));
+    }
+    const numFilter = los.length
+      ? `housenum_lo in (${los.map((n) => `'${n}'`).join(',')})`
+      : `housenum_lo='${q(p.house_number)}'`;
     const r = await settle(
       getJson<Array<Record<string, unknown>>>(
         soda(NYC_ROLL, {
-          $where: `housenum_lo='${q(p.house_number)}' AND (${rollLike})${boro}`,
+          $where: `${numFilter} AND (${rollLike})${boro}`,
           $select: rollSelect,
           $order: 'year DESC',
-          $limit: '1',
+          $limit: '200',
         }),
         'NYC assessment roll (8y4t-faws)',
       ),
     );
-    if (r.ok) rollRow = r.value[0] ?? null;
+    // $order year DESC, so the first containing row is also the newest roll year.
+    if (r.ok) {
+      const contains = r.value.filter((row) => {
+        const lo = num(row.housenum_lo);
+        if (lo === null || target === null) return false;
+        const hi = num(row.housenum_hi);
+        if (hi === null) return lo === target;
+        if (lo > target || hi < target) return false;
+        // Odd and even numbers sit on OPPOSITE sides of a US street, so a range
+        // whose ends share a parity enumerates only that parity: 349-353 is
+        // 349/351/353 and does NOT contain 350. Without this, 350 5th Ave
+        // resolved to the odd-side lot across the street from the Empire State
+        // Building — both ranges span 350 numerically (2026-07-27).
+        if (lo % 2 === hi % 2 && target % 2 !== lo % 2) return false;
+        return true;
+      });
+      rollRow = contains.find((row) => num(row.housenum_lo) === target) ?? contains[0] ?? null;
+    } else warnings.push(`Assessment roll unavailable: ${r.error}`);
   }
 
   if (!rows.length && !rollRow) {
@@ -893,14 +1070,41 @@ async function lookupNyc(p: ParsedAddress, maxSales: number): Promise<PropertyRe
 
   const primary = rows[0] ?? {};
   const boroCode = str(primary.borough) ?? str(rollRow?.boro) ?? null;
+  // Show the parcel's full house-number range when it spans one, so a caller who
+  // asked about 350 can see they were answered from the 338-350 lot rather than
+  // reading "338 5 AVENUE" as us having matched the wrong building.
+  const rollLo = rollRow ? str(rollRow.housenum_lo) : null;
+  const rollHi = rollRow ? str(rollRow.housenum_hi) : null;
   const matchedAddress =
     str(primary.address) ??
-    (rollRow ? `${str(rollRow.housenum_lo) ?? ''} ${str(rollRow.street_name) ?? ''}`.trim() : p.input);
+    (rollRow
+      ? `${rollLo ?? ''}${rollHi && rollHi !== rollLo ? `-${rollHi}` : ''} ${str(rollRow.street_name) ?? ''}`.trim()
+      : p.input);
+
+  // "350 5th Ave, New York" names no borough, and the same street number exists
+  // on the same street name in several of them. We answer from rows[0], so say
+  // out loud when that pick was arbitrary rather than letting one borough's
+  // sale history pass for the address the caller meant.
+  const boros = new Set(rows.map((r) => str(r.borough)).filter(Boolean) as string[]);
+  if (!boroFilter && boros.size > 1) {
+    warnings.push(
+      `The address did not name a borough and matches exist in ${[...boros]
+        .map((b) => NYC_BOROUGH_NAME[b] ?? b)
+        .join(', ')}. Answered from ${
+        boroCode ? NYC_BOROUGH_NAME[boroCode] ?? boroCode : 'the first match'
+      } — re-ask with the borough (e.g. "Manhattan") to pin it down.`,
+    );
+  }
 
   const uniqAddrs = new Map<string, { address: string; parcel_id: string | null; hint?: string | null }>();
   for (const r of rows.slice(1)) {
-    const addr = str(r.address);
-    if (!addr || addr === matchedAddress) continue;
+    const plain = str(r.address);
+    if (!plain) continue;
+    const rBoro = str(r.borough);
+    // Borough-qualified, because the same street number on the same street name
+    // in two boroughs is two different buildings and must not dedupe together.
+    const addr = `${plain}${rBoro && NYC_BOROUGH_NAME[rBoro] ? `, ${NYC_BOROUGH_NAME[rBoro]}` : ''}`;
+    if (plain === matchedAddress && rBoro === boroCode) continue;
     if (!uniqAddrs.has(addr)) {
       uniqAddrs.set(addr, {
         address: addr,
@@ -1324,7 +1528,13 @@ async function lookupSf(p: ParsedAddress, _maxSales: number): Promise<PropertyRe
   const core = p.street_tokens.filter(
     (t, i) => !(i === p.street_tokens.length - 1 && STREET_TYPE_TOKENS.has(t)),
   );
-  const nameVariants = streetVariants(core);
+  // The street type is dropped above, so the trailing "%" sits directly against
+  // the last name token — and against a bare number that lets the wildcard eat
+  // the rest of another street's name: "% 0001 2%" matched "0001 21ST AV" for
+  // "1 Second Street" (measured 2026-07-27). SF always writes the ordinal
+  // suffix ("21ST", "22ND", "25TH"), so the suffix-stripped forms are dead
+  // weight here anyway and dropping them costs no recall.
+  const nameVariants = streetVariants(core).filter((v) => !/(?:^|\s)\d+$/.test(v));
   const padded = p.house_number ? p.house_number.replace(/\D/g, '').padStart(4, '0') : null;
   // property_location is stored uppercase, so skip upper() — wrapping the column
   // in a function turns this into a full scan of ~3.9M roll rows and blows the
@@ -1530,6 +1740,7 @@ interface NotCovered {
   inference_basis: string;
   address_interpreted: ReturnType<typeof interpreted>;
   supported_jurisdictions: Array<{ jurisdiction: string; name: string; sale_prices: boolean; owner: boolean }>;
+  byok_alternatives: Array<{ pack: string; tool: string; auth_argument: '_apiKey'; answers: string }>;
   note: string;
 }
 
@@ -1547,6 +1758,32 @@ function notCovered(p: ParsedAddress, inf: Inference): NotCovered {
       sale_prices: j.slug !== 'sf',
       owner: j.slug !== 'sf',
     })),
+    byok_alternatives: [
+      {
+        pack: 'attom',
+        tool: 'attom_assessment / attom_avm / attom_sales_history',
+        auth_argument: '_apiKey',
+        answers: 'assessed value and property tax / estimated market value / past sale transactions',
+      },
+      {
+        pack: 'realestateapi',
+        tool: 'realestateapi_property_detail',
+        auth_argument: '_apiKey',
+        answers: 'estimated value, last sale, owner, and property characteristics',
+      },
+      {
+        pack: 'rentcast',
+        tool: 'get_property',
+        auth_argument: '_apiKey',
+        answers: 'nationwide property details and value fields where the vendor has coverage',
+      },
+      {
+        pack: 'batchdata',
+        tool: 'batchdata_property_lookup',
+        auth_argument: '_apiKey',
+        answers: 'nationwide property record lookup by address',
+      },
+    ],
     note:
       (where
         ? `"${where}" is not one of the jurisdictions this pack covers. `
@@ -1556,7 +1793,8 @@ function notCovered(p: ParsedAddress, inf: Inference): NotCovered {
       (where
         ? 'For this address, the county assessor or recorder of deeds for that county is the authoritative source; many publish a free online parcel search. '
         : 'Re-ask with the city and state (e.g. "123 Main St, Philadelphia PA") — or pass the jurisdiction argument explicitly. ') +
-      'Do not present an answer as if this property were in the dataset.',
+      'To query a commercial nationwide source through Pipeworx, call one of byok_alternatives and pass that vendor account key as `_apiKey`; Pipeworx does not currently provide a shared key for those packs. ' +
+      'Do not present an answer as if this property were in the keyless dataset.',
   };
 }
 
